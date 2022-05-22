@@ -1,10 +1,10 @@
 # single_cell_rna_seq
 Workflow for processing single cell RNA seq data 
 
-@author: Dr Jasmine Wilson <br />
+@author: Dr Jasmine Wilson 
 
-**Workflow contents:** <br />
-    - Quality control <br />
+## **Workflow contents:** 
+    ### * Quality control <br />
     - Scaling data <br />
     - Query clustering parameters for dimensionality reduction <br />
     *Tabspace*- *Jackstraw & Elbow plot* <br />
