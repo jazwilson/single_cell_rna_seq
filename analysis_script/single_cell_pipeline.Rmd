@@ -1,0 +1,982 @@
+---
+title: "Single_cell_seq_pipeline"
+output: pdf_notebook
+---
+
+Author: Dr Jasmine J Wilson
+
+```{r Load Libraries}
+
+pacman::p_load(AnnotationDbi, cowplot, celldex, data.table, dplyr, enrichplot, fgsea, ggrepel, ggplot2, magrittr, matrix, pathview, patchwork, org.Mm.eg.db,  glmGamPoi, scCATCH, scCustomize, sctransform, seriation, Seurat, SingleR, SingleCellExperiment, tidyverse, wesanderson, viridis, future, scRNAseq, scuttle, scran, clusterProfiler)
+
+imGen.se  <- ImmGenData()
+
+plan("multisession", workers = 32) #number of cores to use
+options(future.globals.maxSize = 6000 * 1024^2)
+plan()
+
+```
+
+
+```{r Load Seurat object}
+
+obj <- readRDS(file = "yourpathfilehere/seuratobj.rds")
+
+```
+
+## QC
+
+-   Calculate %mitochondrial genes
+
+-   Filter cells with unique feature counts
+
+-   Filter cells that have >5% mitochondrial counts
+
+-   LogNormalise data
+
+```{r}
+# store mitochondrial percentage in object meta data 
+obj <- PercentageFeatureSet(obj, 
+                            pattern = "^MT-", #MT/whatever your mito gene column is named  
+                            col.name = "percent.mt")
+```
+
+
+#### Transform data option 1: Manual
+
+```{r QC manual}
+
+# Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+obj <- subset(obj, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+
+# Normalizing the data 
+#By default, we employ a global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default), and log-transforms the result. Normalized values are stored in pbmc[["RNA"]]@data.
+
+obj <- NormalizeData(obj, normalization.method = "LogNormalize", scale.factor = 10000)
+
+```
+
+#### Transform data: option 2: scTransform
+
+```{r}
+
+# run sctransform
+obj <- SCTransform(obj, vars.to.regress = "percent.mt", verbose = FALSE)
+
+# To increase speed of this process "The latest version of sctransform also supports using glmGamPoi package which substantially improves the speed of the learning procedure. It can be invoked by specifying method="glmGamPoi"."
+
+#To install
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("glmGamPoi")
+
+obj <- SCTransform(obj, method = "glmGamPoi", vars.to.regress = "percent.mt", verbose = FALSE)
+
+```
+
+### Scaling the data
+
+Next, we apply a linear transformation ('scaling') that is a standard pre-processing step prior to dimensional reduction techniques like PCA. The [`ScaleData()`](https://satijalab.org/seurat/reference/ScaleData.html) function:
+
+-   Shifts the expression of each gene, so that the mean expression across cells is 0
+
+-   Scales the expression of each gene, so that the variance across cells is 1
+
+    -   This step gives equal weight in downstream analyses, so that highly-expressed genes do not dominate
+
+-   The results of this are stored in `pbmc[["RNA"]]@scale.data`
+
+```{r scaling data}
+all.genes <- rownames(obj)
+obj       <- ScaleData(obj, features = all.genes)
+
+```
+
+## Query clustering parameters
+
+### Dimetionality reduction
+
+```{r}
+# Jackstraw
+# NOTE: This process can take a long time for big data sets, and can use ElbowPlot() to reduce computation time
+obj <- JackStraw(obj, num.replicate = 100)
+obj <- ScoreJackStraw(obj, dims = 1:20)
+JackStrawPlot(pbmc, dims = 1:15)
+
+# Elbow plot
+p1 <- ElbowPlot(obj, ndims = 40)
+ggsave(p1, file= "filepath.pdf", width = 10, height = 10)
+```
+
+
+### Variance modelling
+
+```{r}
+sce <- as.SingleCellExperiment(obj)
+dec <- modelGeneVar(sce)
+plot(dec$mean, dec$total, xlab="Mean log-expression", ylab="Variance")
+
+curve(metadata(dec)$trend(x), col="blue", add=TRUE)
+
+#We can then extract some top genes for use in downstream procedures using the getTopHVGs() function. A variety of different strategies can be used to define a subset of interesting genes:
+
+# Get the top 10% of genes.
+top.hvgs <- getTopHVGs(dec, prop=0.1)
+
+# Get the top 2000 genes.
+top.hvgs2 <- getTopHVGs(dec, n=2000)
+
+# Get all genes with positive biological components.
+top.hvgs3 <- getTopHVGs(dec, var.threshold=0)
+
+# Get all genes with FDR below 5%.
+top.hvgs4 <- getTopHVGs(dec, fdr.threshold=0.05)
+
+```
+
+### Automated PC choice
+
+```{r}
+sced <- denoisePCA(sce, dec, subset.row=getTopHVGs(dec, prop=0.1))
+ncol(reducedDim(sced, "PCA"))
+
+output <- getClusteredPCs(reducedDim(sce))
+npcs <- metadata(output)$chosen
+reducedDim(sce, "PCAsub") <- reducedDim(sce, "PCA")[,1:npcs,drop=FALSE]
+npcs
+
+reducedDim(sce, "PCAsub") <- reducedDim(sce, "PCA")[,1:40,drop=FALSE]
+```
+
+### Clustertree
+
+```{r}
+seurat <- obj
+Idents(seurat) <- seurat$seurat_clusters
+Idents(seurat) <- seurat$ImmGen.cluster.labels.fine
+Idents(seurat) <- seurat$ImmGen.cluster.labels.broad
+
+seurat2 <- BuildClusterTree(
+  seurat,
+  #dims = 1:40,
+  reorder = FALSE,
+  reorder.numeric = FALSE
+)
+
+tree <- seurat2@tools$BuildClusterTree
+tree$tip.label <- paste0("Cluster ", tree$tip.label)
+
+p <- ggtree::ggtree(tree, aes(x, y)) +
+  #scale_y_reverse() +
+  ggtree::geom_tree() +
+  ggtree::theme_tree() +
+  ggtree::geom_tiplab(offset = 1, size = 4) +
+  ggtree::geom_tippoint(color = custom_colors$discrete[1:length(tree$tip.label)], shape = 16, size = 4) +
+  coord_cartesian(clip = 'off') +
+  theme(plot.margin = unit(c(0,12,0,0), 'cm'))
+
+ggsave('file/name.png', p, height = 12, width = 15)
+```
+
+### Cluster similarity
+
+```{r}
+
+sce <- as.SingleCellExperiment(seurat)
+
+reducedDim(sce, 'PCA_sub') <- reducedDim(sce, 'PCA')[,1:40, drop = FALSE]
+
+g <- scran::buildSNNGraph(sce, use.dimred = 'PCA_sub')
+
+ratio <- bluster::pairwiseModularity(g, seurat@meta.data$num.fine.ident, as.ratio = TRUE) ### change grain
+
+ratio_to_plot <- log10(ratio+1)
+
+p <- ratio_to_plot %>%
+  as_tibble() %>%
+  rownames_to_column(var = 'cluster_1') %>%
+  pivot_longer(
+    cols = 2:ncol(.),
+    names_to = 'cluster_2',
+    values_to = 'probability'
+  ) %>%
+  mutate(
+    cluster_1 = as.character(as.numeric(cluster_1) - 1),
+    cluster_1 = factor(cluster_1, levels = rev(unique(cluster_1))),
+    cluster_2 = factor(cluster_2, levels = unique(cluster_2))
+  ) %>%
+  ggplot(aes(cluster_2, cluster_1, fill = probability)) +
+  geom_tile(color = 'white') +
+  geom_text(aes(label = round(probability, digits = 2)), size = 2.5) +
+  scale_x_discrete(name = 'Cluster', position = 'top') +
+  scale_y_discrete(name = 'Cluster', position = 'left') +
+  scale_fill_gradient(
+    name = 'log10(ratio)', low = 'white', high = '#c0392b', na.value = '#bdc3c7',
+    guide = guide_colorbar(
+      frame.colour = 'black', ticks.colour = 'black', title.position = 'left',
+      title.theme = element_text(hjust = 1, angle = 90),
+      barwidth = 0.75, barheight = 10
+    )
+  ) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    legend.position = 'right',
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,  face="bold"),
+    panel.grid.major = element_blank()
+  )
+
+ggsave('file/name.png', p, height = 12, width = 12)
+
+```
+
+### Cluster stability
+
+```{r}
+DefaultAssay(seurat) <- "RNA"
+sce <- as.SingleCellExperiment(seurat)
+
+reducedDim(sce, 'PCA_sub') <- reducedDim(sce, 'PCA')[,1:40, drop = FALSE]
+
+ass_prob <- bluster::bootstrapStability(sce, FUN = function(x) {
+    g <- buildSNNGraph(x, use.dimred = 'PCA_sub')
+    igraph::cluster_walktrap(g)$membership
+  },
+  clusters = sce$num.fine.ident #grain
+)
+
+p <- ass_prob %>%
+  as_tibble() %>%
+  rownames_to_column(var = 'cluster_1') %>%
+  pivot_longer(
+    cols = 2:ncol(.),
+    names_to = 'cluster_2',
+    values_to = 'probability'
+  ) %>%
+  mutate(
+    cluster_1 = as.character(as.numeric(cluster_1) - 1),
+    cluster_1 = factor(cluster_1, levels = rev(unique(cluster_1))),
+    cluster_2 = factor(cluster_2, levels = unique(cluster_2))
+  ) %>%
+  ggplot(aes(cluster_2, cluster_1, fill = probability)) +
+  geom_tile(color = 'white') +
+  geom_text(aes(label = round(probability, digits = 2)), size = 2.5) +
+  scale_x_discrete(name = 'Cluster', position = 'top') +
+  scale_y_discrete(name = 'Cluster') +
+  scale_fill_gradient(
+    name = 'Probability', low = 'white', high = '#c0392b', na.value = '#bdc3c7',
+    limits = c(0,1),
+    guide = guide_colorbar(
+      frame.colour = 'black', ticks.colour = 'black', title.position = 'left',
+      title.theme = element_text(hjust = 1, angle = 90),
+      barwidth = 0.75, barheight = 10
+    )
+  ) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    legend.position = 'right',
+    panel.grid.major = element_blank()
+  )
+
+ggsave('file/name.png', p, height = 15, width = 15)
+```
+
+### Silhouette
+
+```{r}
+library(cluster)
+seurat2 = tinycells.clus
+  Idents(seurat2) <- seurat2$ImmGen.cluster.labels.fine
+
+distance_matrix <- dist(Embeddings(seurat2[['pca']])[, 1:40])
+clusters <- seurat2@meta.data$ImmGen.cluster.labels.fine ### grain
+silhouette <- silhouette(as.numeric(clusters), dist = distance_matrix)
+seurat@meta.data$silhouette_score <- silhouette[,3]
+
+mean_silhouette_score <- mean(seurat@meta.data$silhouette_score)
+
+p <- seurat2@meta.data %>%
+  mutate(barcode = rownames(.)) %>%
+  arrange(seurat_clusters,-silhouette_score) %>% ### grain
+  mutate(barcode = factor(barcode, levels = barcode)) %>%
+  ggplot() +
+  geom_col(aes(barcode, silhouette_score, fill = seurat_clusters), show.legend = FALSE) + ### grain 
+  geom_hline(yintercept = mean_silhouette_score, color = 'red', linetype = 'dashed') +
+  scale_x_discrete(name = 'Cells') +
+  scale_y_continuous(name = 'Silhouette score') +
+  scale_fill_manual(values = custom_colors$discrete) +
+  theme_bw() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+ggsave('file/name.png', p, height = 4, width = 8)
+```
+
+# Clustering dataset
+
+```{r}
+# Parameters
+baseline_clustering_resolution     = 0.8
+baseline_minimum_distance          = 0.2
+baseline_spread                    = 0.5
+baseline_principle_components      = 40
+baseline_dims                      = 1:40
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+
+obj <- RunPCA(obj, npcs = baseline_principle_components, verbose = FALSE)
+
+obj <- RunUMAP(obj, 
+               reduction = "pca", 
+               dims      = baseline_dims, 
+               min.dist  = baseline_minimum_distance, 
+               spread    = baseline_spread)
+
+
+obj <- FindNeighbors(obj, reduction="pca", dims = baseline_dims)
+
+obj <- FindClusters(obj, resolution = baseline_clustering_resolution)
+  
+#Annotate with immgen database 
+  obj.se   <- as.SingleCellExperiment(obj)
+  pred.obj <- SingleR(test     = obj.se,
+                      ref      = imGen.se,
+                      labels   = annotation_levels,
+                      method   = "cluster",
+                      clusters = obj.se@colData$seurat_clusters) #can be modified 
+
+  obj[[annotation_name]] <- pred.obj$labels[match(obj[[]][["seurat_clusters"]],rownames(pred.obj))]
+  
+plot.umapBySample.obj  <- DimPlot(obj, reduction="umap",group.by=annotation_name,label=TRUE)
+plot.umapBySeu.obj  <- DimPlot(obj, reduction="umap",group.by="seurat_clusters",label=TRUE)
+
+```
+
+
+# Query identify of clusters
+
+## Calculate positive high discrimination markers across all cluster 
+
+```{r}
+
+#seurat find markers
+  markers              = FindAllMarkers(obj)
+  saveRDS(markers, "filename/name.rds")
+
+  markers.significant = subset(markers,avg_log2FC>0&p_val_adj<0.05)
+  #Positive high discrimination markers
+  markers.top         = group_by(markers.significant,cluster) %>% top_n(n=-50, wt=p_val_adj) %>% .$gene %>% unique()
+  saveRDS(markers.top, "filename/name.rds")
+
+#heatmap
+    HP <- DoHeatmap(clustered_cells,features=markers.top, size=3,raster = FALSE) + 
+                    theme(text = element_text(size = 3))
+
+    ggsave(file='filename/name.pdf', width=6, height=, units = "in", limitsize = FALSE)
+
+#DOT PLOT
+
+    dp <-  DotPlot( object = cells, 
+                    features = markers_to_plot) +
+                    scale_color_gradientn(colours = rainbow(5))  +
+                    coord_flip() 
+
+    ggsave("filename/names.pdf", width = 10, height = 5, limitsize = FALSE)
+```
+
+## Find variable features of specific clusters or cluster comparisons
+
+```{r}
+# set ident to seurat clusters
+
+# find all markers of cluster 2
+cluster2.markers <- FindMarkers(obj, ident.1 = 2, min.pct = 0.25)
+head(cluster2.markers, n = 5)
+
+# find all markers distinguishing cluster 5 from clusters 0 and 3
+cluster5.markers <- FindMarkers(obj, ident.1 = 5, ident.2 = c(0, 3), min.pct = 0.25)
+head(cluster5.markers, n = 5)
+
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+obj.markers <- FindAllMarkers(obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+obj.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 2, order_by = avg_log2FC)
+
+#Seurat has several tests for differential expression which can be set with the test.use parameter (see our DE vignette for details). For example, the ROC test returns the ‘classification power’ for any individual marker (ranging from 0 - random, to 1 - perfect).
+
+cluster0.markers <- FindMarkers(obj, ident.1 = 0, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+
+
+```
+
+
+## Define selected features to annotate clusters
+
+### A) Upload your find markers file (which should be an RDS file)
+
+```{r}
+### Define markers to plot
+    markers_to_plot = readRDS("your find markers file here.rds")
+```
+
+### B) Upload your own CSV of genes
+
+To make this, first in excel: **- Name the first column: genes - Underneath this, list your genes of interest within the column with the format: Aaaa (Capital first, then lowercase). - Save as both excel and csv**
+
+```{r}
+    gene_list = read_csv('your gene list here.csv')
+    #pulling this column only into our dataframe of gene list 
+    markers_to_plot = gene_list %>% pull(genes)
+```
+
+### C) Define your own here
+
+```{r}
+### Define markers to plot
+    markers_to_plot = c("Agene", "Bgene", "Cgene")
+```
+
+## Plot features
+
+### Dotplot 
+
+```{r}
+cells <- obj
+
+#Set idents to plot
+Idents(cells) <- cells$ImmGen.cluster.labels.broad
+#or 
+Idents(cells) <- cells$seurat_clusters
+
+dp <- DotPlot( object = cells, features = markers_to_plot) + 
+      scale_color_gradientn(colours = rainbow(5)) +
+      theme(axis.text.x   = element_text(angle = 90))
+
+ggsave("filepath/name.pdf", width = 10, height = 12, limitsize = FALSE)
+    
+```
+
+### Density plot
+
+```{r}
+fp   <- FeaturePlot(cells, reduction="umap", features = "Cd3d") 
+
+## Co-expression
+fp2  <- FeaturePlot(cells, features = c("Ccr2", "Ccr5"), blend = TRUE)
+```
+
+### Violin plot
+
+```{r}
+
+vp <- VlnPlot(clustered_data, features = c("Ccr2", "Ccr5")) 
+
+```
+
+### Heatmap top features
+
+```{r}
+#DoHeatmap() generates an expression heatmap for given cells and features. In this case, we are plotting the top 10 markers (or all markers if less than 20) for each cluster.
+
+obj.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) -> top10
+DoHeatmap(obj, features = top10$gene) + NoLegend()
+
+```
+
+### Heatmap selected features
+
+```{r}
+
+#downsampled for plotting -  seurat object was too large to plot 
+
+ sampledCellstiny               <- sample(x=rownames(cells@meta.data), 10000)
+ tinycells.clus                 <- subset(cells, cells=sampledCellstiny)
+ 
+ Idents(tinycells.clus) <- tinycells.clus$ImmGen.cluster.labels.broad
+    
+feature_g = c("Gene1","Gene2","Gene3") 
+
+d1 <- DoHeatmap(tinycells.clus, 
+                features = feature_g, 
+                group.by = "seurat_clusters", 
+                raster = FALSE)
+
+```
+
+### Column plot
+
+```{r}
+
+C1 <- ggplot(obj@meta.data, 
+             aes(x    = obj$vaccine_mousestrain_mtbstrain,
+                 fill = obj$seurat_clusters)) +
+      geom_bar(position = "fill", width = 0.5) +
+      xlab("Sample") +
+      ylab("Proportion") +
+      labs(x = "", fill = "Cluster")
+
+```
+
+## scCatch - another program to annotate clusters
+
+```{r scCatch}
+
+#subsample to test
+ sampledCellstiny  <- sample(x=rownames(cells@meta.data), 50000)
+ tinycells.clus    <- subset(cells, cells=sampledCellstiny)
+
+#convert seurat to matrix to later bind scCatch annotation
+
+# scCATCH lung match only
+scCATCH_markers = findmarkergenes(cells,
+                                  species = 'Mouse',
+                                  cluster = "All",
+                                  match_CellMatch = T,
+                                  tissue = c('Lung'))
+scCATCH_ann <- scCATCH(object = scCATCH_markers$clu_markers,
+                       species = 'Mouse',
+                       tissue = c('Lung'))
+
+saveRDS(scCATCH_markers, file = "file/name.rds")
+saveRDS(scCATCH_ann, file = "file/name.rds")
+
+cluster2celltype = scCATCH_ann$cell_type %>% set_names(scCATCH_ann$cluster)
+unlabled_clusters = cells@meta.data %>% filter(!seurat_clusters %in% scCATCH_ann$cluster) %>% pull(seurat_clusters) %>% unique()
+cluster2celltype = c(cluster2celltype,rep('Unknown',length(unlabled_clusters)) %>% set_names(unlabled_clusters))
+
+
+scCATCH_ann$celltype_related_marker %>% unique()
+cells[['scCatch_ann']] = cluster2celltype[cells@meta.data$seurat_clusters]
+
+saveRDS(cells, file = "file/name.rds")
+
+### Dim plot
+
+sc.obj  <- DimPlot(cells, reduction="umap",group.by="scCatch_ann",label=TRUE)
+ggsave(sc.obj, file= "file/name.pdf", width = 20, height = 15)
+
+cells = cells.clus
+
+### scCATCH all match 
+scCATCH_markers = findmarkergenes(tinycells.clus,
+                                  species = 'Mouse',
+                                  cluster = "All",
+                                  match_CellMatch = T,
+                                  tissue = c('Bronchiole'
+                                             ,'Fetal lung'
+                                             ,'Lung'
+                                             ,'Trachea'
+                                             ,'Lymph node'
+                                             ,'Lymphoid tissue'
+                                             ,'Mesenteric lymph node'
+                                             ,'Peyer patch'
+                                             ,'Spleen'
+                                             ,'Aorta'
+                                             ,'Artery'
+                                             ,'Blood vessel'
+                                             ,'Carotid artery'
+                                             ,'Basilar membrane'
+                                             ,'Epithelium'
+                                             ,'Peritoneal cavity'
+                                             ,'Thymus'
+                                             )
+                                  )
+scCATCH_ann <- scCATCH(object = scCATCH_markers$clu_markers,
+                       species = 'Mouse',
+                       tissue = c('Bronchiole'
+                                             ,'Fetal lung'
+                                             ,'Lung'
+                                             ,'Trachea'
+                                             ,'Lymph node'
+                                             ,'Lymphoid tissue'
+                                             ,'Mesenteric lymph node'
+                                             ,'Peyer patch'
+                                             ,'Spleen'
+                                             ,'Aorta'
+                                             ,'Artery'
+                                             ,'Blood vessel'
+                                             ,'Carotid artery'
+                                             ,'Basilar membrane'
+                                             ,'Epithelium'
+                                             ,'Peritoneal cavity'
+                                             ,'Thymus'
+                                             ))
+
+saveRDS(scCATCH_markers, file = "file/name.rds")
+saveRDS(scCATCH_ann, file = "file/name.rds")
+
+cluster2celltype = scCATCH_ann$cell_type %>% set_names(scCATCH_ann$cluster)
+unlabled_clusters = cells@meta.data %>% filter(!seurat_clusters %in% scCATCH_ann$cluster) %>% pull(seurat_clusters) %>% unique()
+cluster2celltype = c(cluster2celltype,rep('Unknown',length(unlabled_clusters)) %>% set_names(unlabled_clusters))
+
+
+scCATCH_ann$celltype_related_marker %>% unique()
+cells[['scCatch_ann']] = cluster2celltype[cells@meta.data$seurat_clusters]
+
+saveRDS(cells, file = "file/name.rds")
+
+### Dim plot
+
+sc.obj  <- DimPlot(cells, reduction="umap",group.by="scCatch_ann",label=TRUE)
+ggsave(sc.obj, file= "file/name.pdf", width = 20, height = 15)
+
+```
+
+## Assigning cell types
+
+### Rename clusters
+
+```{r}
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "Memory CD4 T", "B", "CD8 T")
+names(new.cluster.ids) <- levels(obj)
+obj <- RenameIdents(obj, new.cluster.ids)
+DimPlot(obj, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+saveRDS(obj, file = "file/obj.rds")
+```
+
+### Assigning cell type based on selected markers
+
+[\<https://github.com/satijalab/seurat/issues/1343>](https://github.com/satijalab/seurat/issues/1343){.uri}
+
+```{r}
+Whichcells(object = obj, expression = Cd4 > 3 & Cd3 > 3)
+```
+
+# Analysis of single cell populations
+
+## Calculate abundance
+
+```{r}
+#Calculate abundance
+      
+      #####   First set samples in the order I want it to be plotted
+c_order =   c(
+  "sample_ID_1" ,
+  "sample_ID_2" ,
+  "sample_ID_3"  )
+
+ ## extract meta data
+    dt  <-  cells@meta.data %>% as.data.table 
+ ## select table variables of interest    
+    dt1 <-   dt %>% select("sample", 
+                           "condition", 
+                           "ImmGen.cluster.labels.broad", 
+                           "timepoint",
+                           "age",
+                           "species",
+                           "group") 
+    dt1 <-  dt1 %>% mutate(condition = factor(condition, levels = c_order), timepoint = factor(timepoint))
+    
+ ## per samples counts
+    dt1_sample  = dt1 %>% group_by(sample) %>% summarise(n_sample=n()) 
+    
+ ## per cluster counts
+    dt1_clus    = dt1 %>% group_by(sample, ImmGen.cluster.labels.broad) %>% summarise(n_clus=n()) %>% ungroup() 
+    
+ ## Join table 1: cluster counts + table 2: sample counts    
+    dt_all           = full_join(dt1_clus, dt1_sample, by = "sample") %>% full_join(dt1, by = c("sample","ImmGen.cluster.labels.broad")) 
+    dt_all$abundance = dt_all$n_clus/dt_all$n_sample
+
+ ## write table out as CSV     
+    write_csv(dt_all, "file/name.csv") 
+    
+    dt_all <- read_csv("file/name.csv")
+
+ ## alternatively define specific cluster to plot
+    dt_p1 = dt_all %>% subset( condition == "disease")
+    dt_p2 = dt_p2  %>% subset( ImmGen.cluster.labels.broad == c("Neutrophils", "Macrophages")) 
+    dt_p3 = dt_all %>% subset( timepoint %in% 5)                                               
+
+ ## plot abundance per cluster (y axis is sample)        
+      p = dt_all %>% ggplot(aes(x=condition, 
+                                y = abundance, 
+                                colour = ImmGen.cluster.labels.broad,
+                                shape = "condition")) +
+          geom_point() +
+          coord_flip() +
+          facet_wrap(~ImmGen.cluster.labels.broad)
+      
+          ggsave("file/name.png", 
+          width = 24, height = 12, limitsize = FALSE)
+
+ ## plot abundance per sample (y axis is seurat clusters)    
+     p2 = dt_all %>% ggplot(aes(x=ImmGen.cluster.labels.broad, 
+                                y = abundance, 
+                                colour = ImmGen.cluster.labels.broad)) +
+          geom_point() +
+          coord_flip() +
+          facet_wrap(~condition, ncol = 10)
+    
+          ggsave("file/name.png", 
+          width = 25, height = 6, limitsize = FALSE)
+
+          
+```
+
+## Subclustering
+
+```{r}
+#list names to choose for making new RDS with specific labelled clusters
+obj$ImmGen.cluster.labels.broad %>% unique()
+
+#Set idents
+Idents(obj) <- obj$ImmGen.cluster.labels.broad
+
+#Subset myeloid cells 
+Myeloid_labels  <- c("Macrophages","Monocytes", "DC", "Neutrophils") 
+Myeloid_cells   <- subset(x = obj, idents = Myeloid_labels, invert = FALSE)
+
+T_labels  <- c("NKT","T cells", "NK cells", "ILC") 
+T_cells   <- subset(x = obj, idents = T_labels, invert = FALSE)
+
+#Scale data > elbow plot > cluster with fine parameters 
+
+```
+
+## Differential analysis
+
+After subsetting myeloid cells into own RDS, here you can do bulk DE myeloid condition 1 v condition 2
+
+```{r}
+d15                  <- subset(obj, timepoint == '15')
+cells$df_combination <- paste(obj$condition, obj$age, obj$species, sep = "_")
+Idents(d15)          <- 'combination'
+
+test_data = FindMarkers(d15, 
+                        ident.1 = 'group_1', 
+                        ident.2 = 'group_2', 
+                        min.pct = 0.20, 
+                        logfc.threshold = 0.25)
+
+background_genes = d15@assays$RNA@counts %>% rownames()
+
+write.csv(test_data, file= "file/name.csv")
+
+```
+
+## DE per cluster - can change the settings to compare labelled or unlabelled clusters
+
+```{r}
+    # For example D34 only
+    pop      <- subset('strain_abc', day %in% 34)
+    mySeurat <- pop
+    
+    # select folder to write files
+    output   <- "filepath/"
+    
+# Create a variable condtaining the conditions we want compared 
+# note: can change seurat clusters to assess and compare, eg. mySeurat$ImmGen.cluster.labels.broad or $seurat_clusters
+    
+mySeurat$celltype.condition <- paste(mySeurat$ImmGen.cluster.labels.broad, 
+                                     mySeurat$df_combination, sep="_")
+mySeurat$celltype <- Idents(mySeurat)
+Idents(mySeurat) <- "celltype.condition"
+for (i in mySeurat$ImmGen.cluster.labels.broad %>% unique()){ 
+          try({
+                  ident1 <- paste0(i,"group_1")
+                  ident2 <- paste0(i,"group_2")
+                  condition.diffgenes <- FindMarkers(mySeurat, 
+                                                     ident.1 = ident1, 
+                                                     ident.2=ident2, 
+                                                     min.pct=0.25, 
+                                                     logfc.threshold=0.25)
+                  write.csv(condition.diffgenes, file=paste0(output,i,".csv"))
+                  })
+          }
+          
+
+          
+```
+
+### Volcano plot
+
+```{r}
+
+#https://biocorecrg.github.io/CRG_RIntroduction/volcano-plots.html  
+  
+#Read in data
+de = read_csv("file.csv")
+
+# The significantly differential expressed genes are the ones found in the upper-left and upper-right corners.
+# Add a column to the data frame to specify if they are UP- or DOWN- regulated (log2FoldChange respectively positive or negative)
+
+        # add a column of NAs
+        de$diffexpressed <- "NO"
+        # if log2Foldchange > 0.6 and pvalue < 0.05, set as "UP" 
+        de$diffexpressed[de$avg_log2FC > 0.6 & de$p_val < 0.05] <- "UP"
+        # if log2Foldchange < -0.6 and pvalue < 0.05, set as "DOWN"
+        de$diffexpressed[de$avg_log2FC < -0.6 & de$p_val < 0.05] <- "DOWN"
+        
+        # Now write down the name of genes beside the points...
+        # Create a new column "delabel" to de, that will contain the name of genes differentially expressed (NA in case they are not)
+        de$delabel <- NA
+        de$delabel[de$diffexpressed != "NO"] <- de$...1[de$diffexpressed != "NO"]
+        
+        # Finally, we can organize the labels nicely using the "ggrepel" package and the geom_text_repel() function
+
+        vp = ggplot(data=de, aes(x=avg_log2FC, y=-log10(p_val), col=diffexpressed, label=delabel)) +
+            geom_point() + 
+            theme_minimal() +
+            geom_text_repel() +
+            scale_color_manual(values=c("red", "black", "blue")) +
+            geom_vline(xintercept=c(-0.6, 0.6), col="grey") +
+            geom_hline(yintercept=-log10(0.05), col="grey") +
+            ggtitle("insert_title")
+        
+        ggsave(plot=vp, "file.pdf", width=10, height=7)
+
+     
+```
+
+### Go analysis
+
+```{r}
+####### Annotate data table
+
+  #Read in data
+  de = read_csv("file.csv")
+  de2   <- de %>% rownames_to_column(var = "gene")
+  background_genes = pop@assays$RNA@counts %>% rownames()
+  
+  # Return the Ensembl IDs for a set of genes
+  # use columns(org.Mm.eg.db) to see the information you can retrieve from this database
+annotations_back <- AnnotationDbi::select(org.Mm.eg.db, # database
+                                   keys = background_genes,  # data to use for retrieval
+                                   columns = c("SYMBOL", "ENTREZID", "GENENAME", "ENSEMBL"), # information to retrieve for given data
+                                   keytype = "SYMBOL") # type of data given in 'keys' argument
+  
+ann_gt      = left_join(de2  ,annotations_back,by=c('...1'='SYMBOL')) #'...1" whatever your column name is
+
+### GO analysis 
+
+genes_up    = subset(ann_gt,  avg_log2FC > 0)
+genes_down  = subset(ann_gt,  avg_log2FC < 0)
+
+#view(Annotated_Gene_Table)
+
+#Create Gene lists : To perform the over-representation analysis, we need a list of background genes and a list of significant genes. For our background dataset we will use all genes tested for differential expression (all genes in our results table). For our significant gene list we will use genes with p-adjusted values less than 0.05 (we could include a fold change threshold too if we have many DE genes)
+allOE_genes <- subset(annotations_back,  !is.na(ENTREZID)) %>% pull(ENTREZID) %>%  unique()
+g_1         <- subset(ann_gt          ,  !is.na(ENTREZID)) %>% pull(ENTREZID) %>%  unique()
+g_up        <- subset(genes_up        ,  !is.na(ENTREZID)) %>% pull(ENTREZID) %>%  unique()
+g_down      <- subset(genes_down      ,  !is.na(ENTREZID)) %>% pull(ENTREZID) %>%  unique()
+
+###Now we can perform the GO enrichment analysis and save the results:
+## Run GO enrichment analysis 
+ego.up   <- enrichGO(gene     = g_down, #can use g_up, g_down
+                universe      = allOE_genes,
+                keyType       = "ENTREZID",
+                OrgDb         = org.Mm.eg.db, 
+                ont           = "ALL", 
+                pAdjustMethod = "BH", 
+                qvalueCutoff  = 0.05, 
+                readable      = TRUE)
+#Barchart
+
+              BP   <- barplot(ego.up, showCategory=30) 
+              ggsave(BP1.up,   file = "file.pdf",      width = 15, height = 20)
+              
+#Dotplot
+              
+              DP   <- dotplot(ego.up, showCategory=30) 
+              ggsave(BP1.up,   file = "file.pdf",      width = 15, height = 20)        
+              
+
+```
+
+### GSEA plot
+
+To perform GSEA analysis of KEGG gene sets, clusterProfiler requires the genes to be identified using Entrez IDs for all genes in our results dataset. We also need to remove the NA values and duplicates (due to gene ID conversion) prior to the analysis:
+
+```{r}
+
+## Using table from above segment
+#Table ann_gt
+
+#remove NA
+a1  <-  dplyr::filter(ann_gt,  ENTREZID !="NA")
+
+# remove any entrez duplication
+a1.2 <- a1[which(duplicated(a1$ENTREZID) == F), ]
+
+# extract the foldchange
+FC.a1  <- a1.2$avg_log2FC
+
+# name each fold change with corresponding entrez ID
+names(FC.a1)  <- a1.2$ENTREZID
+
+# sort fold changes in decreasing order
+FC.a1  <- sort(FC.a1, decreasing = TRUE)
+
+
+######### perform GSEA using KEGG pathway
+
+# GSEA using gene sets associated with BP Gene Ontology terms
+gseaGO <- gseGO(geneList = FC.a1, 
+              OrgDb = org.Mm.eg.db, 
+              ont = 'ALL', 
+              minGSSize = 20, 
+              pvalueCutoff = 0.05,
+              verbose = TRUE) 
+
+
+gseaGO_results <- gseaGO@result
+write.csv(gseaGO_results, "~/filepath/filename.csv", quote=F)
+
+#example for a IFNy pathway
+
+GO.0034341 <- gseaplot2(gseaGO, geneSetID = 'GO:0034341') 
+
+
+```
+
+### Cnet plot
+
+```{r}
+#Gene-Concept Network
+              
+              CP <- cnetplot(gseaGO, categorySize="pvalue", foldChange=FC.a1) 
+              ggsave(BP1.up,   file = "file.pdf",      width = 15, height = 20) 
+              
+              CP2 <- cnetplot(gseaGO, foldChange=FC.a1, circular = TRUE, colorEdge = TRUE) 
+              
+              
+### other examples
+              
+p1 <- cnetplot(gseaGO, node_label="category", cex_label_category = 1.2) 
+p2 <- cnetplot(gseaGO, node_label="gene", cex_label_gene = 0.8) 
+p3 <- cnetplot(gseaGO, node_label="all") 
+p4 <- cnetplot(gseaGO, node_label="none", 
+        color_category='firebrick', 
+        color_gene='steelblue') 
+cowplot::plot_grid(p1, p2, p3, p4, ncol=2, labels=LETTERS[1:4])
+
+
+```
+
+### Tree plot
+
+```{r}
+
+edox2 <- pairwise_termsim(gseaGO)
+p1 <- treeplot(edox2)
+p2 <- treeplot(edox2, hclust_method = "average")
+aplot::plot_list(p1, p2, tag_levels='A')
+```
+
